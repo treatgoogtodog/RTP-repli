@@ -1,6 +1,7 @@
 import argparse
 import socket
 import sys
+import time
 
 from utils import PacketHeader, compute_checksum
 
@@ -9,52 +10,148 @@ MAX_PACKET_SIZE = 1472
 MAX_DATA_CHUNK = MAX_PACKET_SIZE - HEADER_SIZE
 TIMEOUT = 0.5
 
-def build_byte(type, seq_num, data) -> bytes:
-    """Build byte for a packet"""
-    pkt_header = PacketHeader(type=type, seq_num=seq_num, length=len(data))
-    pkt_header.checksum = 0
-    checksum = compute_checksum(pkt_header / data)
-    pkt_header.checksum = checksum
-    return bytes(pkt_header / data)
+TYPE_START = 0
+TYPE_END = 1
+TYPE_DATA = 2
+TYPE_ACK = 3
 
-def read_input() -> list[tuple[int, bytes]]:
-    """Read input from sys.stdin and split into chunks of size MAX_DATA_CHUNK."""
-    data = sys.stdin.buffer.read()
-    chunks = [data[i:i + MAX_DATA_CHUNK] for i in range(0, len(data), MAX_DATA_CHUNK)]
-    sequence_numbers = list(range(1, len(chunks) + 1))
-    return list(zip(sequence_numbers, chunks))
+def build_packet(pkt_type: int, seq_num: int, payload: bytes) -> bytes:
+    """Build packet bytes with a valid checksum."""
+    header = PacketHeader(type=pkt_type, seq_num=seq_num, length=len(payload), checksum=0)
+    header.checksum = compute_checksum(header / payload)
+    return bytes(header / payload)
 
-def socket_setup() -> tuple[socket.socket, tuple[str, int]]:
-    """Set up a UDP socket and bind it to sender IP and port."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(TIMEOUT)
-    peer = socket.getpeername()
-    s.bind(peer)
-    return s, peer
+def parse_and_validate(packet_bytes: bytes):
+    """Return (header, payload) if checksum and format are valid, else None."""
+    if len(packet_bytes) < HEADER_SIZE:
+        return None
 
-def init_handshake(s: socket.socket, peer: tuple[str, int], window_size: int) -> None:
-    """Perform handshake with receiver to establish connection and exchange window size."""
-    start = build_byte(type=0, seq_num=0, data=str(window_size).encode())
-    s.sendto(start, peer)
+    header = PacketHeader(packet_bytes[:HEADER_SIZE])
+    payload = packet_bytes[HEADER_SIZE : HEADER_SIZE + header.length]
+    if len(payload) != header.length:
+        return None
+
+    expected = header.checksum
+    tmp_header = PacketHeader(
+        type=header.type,
+        seq_num=header.seq_num,
+        length=header.length,
+        checksum=0,
+    )
+    actual = compute_checksum(tmp_header / payload)
+    if actual != expected:
+        return None
+
+    return header, payload
+
+def wait_for_start_ack(sock: socket.socket, peer):
+    """Send START and wait until ACK(1) is received."""
+    start_pkt = build_packet(TYPE_START, 0, b"")
     while True:
+        sock.sendto(start_pkt, peer)
         try:
-            data, _ = s.recvfrom(MAX_PACKET_SIZE)
-            pkt = PacketHeader(data)
-            check_integrity = compute_checksum(PacketHeader(type=pkt.type, seq_num=pkt.seq_num, length=pkt.length, checksum=0) / data[16:]) == pkt.checksum
-            if pkt.type == 1 and pkt.seq_num == 0 and check_integrity:
-                break
+            packet_bytes, _ = sock.recvfrom(MAX_PACKET_SIZE)
+            parsed = parse_and_validate(packet_bytes)
+            if parsed is None:
+                continue
+            header, _ = parsed
+            if header.type == TYPE_ACK and header.seq_num == 1:
+                return
         except socket.timeout:
-            s.sendto(start, peer)
-    
+            # Retransmit START on timeout.
+            continue
 
+def transfer_data(sock: socket.socket, peer, chunks: list[bytes], window_size: int):
+    """Transfer DATA packets using cumulative ACKs and a single retransmission timer."""
+    total_packets = len(chunks)
+    if total_packets == 0:
+        return 0
+
+    packets = {
+        seq_num: build_packet(TYPE_DATA, seq_num, chunk)
+        for seq_num, chunk in enumerate(chunks, start=1)
+    }
+
+    base_seq = 1
+    next_seq = 1
+    timer_start = time.monotonic()
+
+    while base_seq <= total_packets:
+        while next_seq <= total_packets and next_seq < base_seq + window_size:
+            sock.sendto(packets[next_seq], peer)
+            next_seq += 1
+
+        elapsed = time.monotonic() - timer_start
+        remaining = TIMEOUT - elapsed
+        if remaining <= 0:
+            for seq_num in range(base_seq, next_seq):
+                sock.sendto(packets[seq_num], peer)
+            timer_start = time.monotonic()
+            continue
+
+        sock.settimeout(remaining)
+        try:
+            packet_bytes, _ = sock.recvfrom(MAX_PACKET_SIZE)
+            parsed = parse_and_validate(packet_bytes)
+            if parsed is None:
+                continue
+
+            header, _ = parsed
+            if header.type != TYPE_ACK:
+                continue
+
+            ack_seq = header.seq_num
+            if base_seq < ack_seq <= total_packets + 1:
+                base_seq = ack_seq
+                timer_start = time.monotonic()
+        except socket.timeout:
+            for seq_num in range(base_seq, next_seq):
+                sock.sendto(packets[seq_num], peer)
+            timer_start = time.monotonic()
+
+    return total_packets
+
+def finish_connection(sock: socket.socket, peer, end_seq: int):
+    """Send END and exit on END ACK or 500ms timeout."""
+    end_pkt = build_packet(TYPE_END, end_seq, b"")
+    sock.sendto(end_pkt, peer)
+    sent_at = time.monotonic()
+
+    while time.monotonic() - sent_at < TIMEOUT:
+        remaining = TIMEOUT - (time.monotonic() - sent_at)
+        sock.settimeout(max(0.0, remaining))
+        try:
+            packet_bytes, _ = sock.recvfrom(MAX_PACKET_SIZE)
+            parsed = parse_and_validate(packet_bytes)
+            if parsed is None:
+                continue
+
+            header, _ = parsed
+            if header.type == TYPE_ACK and header.seq_num == end_seq + 1:
+                return
+        except socket.timeout:
+            return
 
 def sender(receiver_ip, receiver_port, window_size) -> None:
-    """TODO: Open socket and send message from sys.stdin."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    pkt_header = PacketHeader(type=2, seq_num=10, length=14)
-    pkt_header.checksum = compute_checksum(pkt_header / "Hello, world!\n")
-    pkt = pkt_header / "Hello, world!\n"
-    s.sendto(bytes(pkt), (receiver_ip, receiver_port))
+    """Send stdin bytes reliably over UDP using RTP-base semantics."""
+    if window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+
+    peer = (receiver_ip, receiver_port)
+    data = sys.stdin.buffer.read()
+    chunks = [data[i : i + MAX_DATA_CHUNK] for i in range(0, len(data), MAX_DATA_CHUNK)]
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(TIMEOUT)
+
+    try:
+        wait_for_start_ack(sock, peer)
+        total_packets = transfer_data(sock, peer, chunks, window_size)
+        end_seq = total_packets + 1
+        finish_connection(sock, peer, end_seq)
+    finally:
+        sock.close()
+    
 
 
 def main():
