@@ -62,7 +62,7 @@ def wait_for_start_ack(sock: socket.socket, peer):
             continue
 
 def transfer_data(sock: socket.socket, peer, chunks: list[bytes], window_size: int):
-    """Transfer DATA packets using cumulative ACKs and a single retransmission timer."""
+    """Transfer DATA packets using cumulative ACKs and whole-window retransmission."""
     total_packets = len(chunks)
     if total_packets == 0:
         return 0
@@ -71,7 +71,7 @@ def transfer_data(sock: socket.socket, peer, chunks: list[bytes], window_size: i
         seq_num: build_packet(TYPE_DATA, seq_num, chunk)
         for seq_num, chunk in enumerate(chunks, start=1)
     }
-
+    
     base_seq = 1
     next_seq = 1
     timer_start = time.monotonic()
@@ -133,7 +133,7 @@ def finish_connection(sock: socket.socket, peer, end_seq: int):
             return
 
 def sender(receiver_ip, receiver_port, window_size) -> None:
-    """Send stdin bytes reliably over UDP using RTP-base semantics."""
+    """Send stdin bytes reliably over UDP using cumulative-ACK semantics."""
     if window_size <= 0:
         raise ValueError("window_size must be a positive integer")
 
