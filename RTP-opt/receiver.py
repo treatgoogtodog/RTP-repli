@@ -87,11 +87,13 @@ def handle_data_packet(
         next_expected += 1
         while next_expected in out_of_order_buffer:
             flush_to_stdout(out_of_order_buffer.pop(next_expected))
-            sock.sendto(build_ack(next_expected), sender_addr)
             next_expected += 1
     else:
-        if header.seq_num not in out_of_order_buffer and header.seq_num < next_expected + window_size:
-            out_of_order_buffer[header.seq_num] = payload
+        if header.seq_num < next_expected + window_size:
+            # Keep first copy, but ACK every in-window packet (including duplicates)
+            # so sender does not wait for timeout when an ACK is lost.
+            if header.seq_num not in out_of_order_buffer:
+                out_of_order_buffer[header.seq_num] = payload
             sock.sendto(build_ack(header.seq_num), sender_addr)
     return next_expected
 
