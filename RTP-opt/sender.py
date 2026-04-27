@@ -75,24 +75,20 @@ def transfer_data(sock: socket.socket, peer, chunks: list[bytes], window_size: i
 
     base_seq = 1
     next_seq = 1
-    acked = {}
+    unacked_inflight: set[int] = set()
     timer_start = time.monotonic()
 
     while base_seq <= total_packets:
         while next_seq <= total_packets and next_seq < base_seq + window_size:
             sock.sendto(packets[next_seq], peer)
-            acked[next_seq] = False
+            unacked_inflight.add(next_seq)
             next_seq += 1
-
-        while base_seq <= total_packets and acked.get(base_seq, False):
-            base_seq += 1
             
         elapsed = time.monotonic() - timer_start
         remaining = TIMEOUT - elapsed
         if remaining <= 0:
-            for seq_num in range(base_seq, next_seq):
-                if not acked.get(seq_num, False):
-                   sock.sendto(packets[seq_num], peer)
+            for seq_num in sorted(unacked_inflight):
+                sock.sendto(packets[seq_num], peer)
             timer_start = time.monotonic()
             continue
 
@@ -108,14 +104,25 @@ def transfer_data(sock: socket.socket, peer, chunks: list[bytes], window_size: i
                 continue
 
             ack_seq = header.seq_num
-            
-            if base_seq <= ack_seq <= total_packets:
-                acked[ack_seq] = True
+
+            # Only treat ACK as progress if it acknowledges a currently-unacked
+            # packet inside the active send range. Duplicate ACKs should not
+            # keep postponing timeout-driven retransmissions.
+            if base_seq <= ack_seq < next_seq and ack_seq in unacked_inflight:
+                unacked_inflight.remove(ack_seq)
+
+                # Slide base across any newly contiguous acknowledged packets.
+                while (
+                    base_seq <= total_packets
+                    and base_seq < next_seq
+                    and base_seq not in unacked_inflight
+                ):
+                    base_seq += 1
+
                 timer_start = time.monotonic()
         except socket.timeout:
-            for seq_num in range(base_seq, next_seq):
-                if not acked.get(seq_num, False):
-                   sock.sendto(packets[seq_num], peer)
+            for seq_num in sorted(unacked_inflight):
+                sock.sendto(packets[seq_num], peer)
             timer_start = time.monotonic()
 
     return total_packets
